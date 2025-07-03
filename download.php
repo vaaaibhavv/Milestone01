@@ -20,7 +20,7 @@ function encryptWithPublicKey($plainText, $publicKeyPath = 'abdm_public.pem') {
 
     if (!file_exists($outputFile) || filesize($outputFile) === 0) {
         unlink($inputFile); unlink($outputFile);
-        throw new Exception("Encryption failed");
+        throw new Exception("🔐 Encryption failed. Make sure the public key is valid.");
     }
 
     $encrypted = file_get_contents($outputFile);
@@ -77,12 +77,12 @@ function requestOtp($aadhaarEncrypted, $accessToken) {
     curl_close($ch);
 
     if ($httpCode !== 200) {
-        throw new Exception("OTP request failed with HTTP $httpCode. Response: $response");
+        throw new Exception("❌ OTP request failed with HTTP $httpCode\nResponse: $response");
     }
 
     $data = json_decode($response, true);
     if (empty($data['txnId'])) {
-        throw new Exception("txnId not found in OTP response.");
+        throw new Exception("❌ txnId not found in OTP response.");
     }
 
     return $data['txnId'];
@@ -135,9 +135,12 @@ function verifyOtp($txnId, $otpEncrypted, $accessToken, $mobile) {
     ];
 }
 
-// === Step 3: Download ABHA Card PDF ===
-function downloadAbhaCard($authToken, $xToken, $requestId, $timestamp) {
+// === Step 3: Download ABHA Card PDF with retry ===
+// === Step 3: Download ABHA Card (PNG/PDF) ===
+function downloadAbhaCard($authToken, $xToken) {
     $url = "https://abhasbx.abdm.gov.in/abha/api/v3/profile/account/abha-card";
+    $requestId = generateUuidV4();
+    $timestamp = getISOTimestamp();
 
     $headers = [
         "X-Token: Bearer $xToken",
@@ -149,25 +152,54 @@ function downloadAbhaCard($authToken, $xToken, $requestId, $timestamp) {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => $headers
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_HEADER => true // so we can read both header + body
     ]);
 
     $response = curl_exec($ch);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headersRaw = substr($response, 0, $headerSize);
+    $body = substr($response, $headerSize);
     curl_close($ch);
 
-    if ($httpCode === 200) {
-        file_put_contents("abha-card.pdf", $response);
-        echo "✅ ABHA Card downloaded as 'abha-card.pdf'\n";
-    } else {
-        echo "❌ Failed to download ABHA card. HTTP $httpCode\n";
-        echo "Response: $response\n";
+    if (!in_array($httpCode, [200, 202])) {
+        throw new Exception("❌ Failed to download ABHA card. HTTP $httpCode\n$response");
     }
+
+    // Try to get content-type from headers
+    preg_match('/content-type:\s*([\w\/\-]+)\s*/i', $headersRaw, $matches);
+    $contentType = strtolower(trim($matches[1] ?? ''));
+
+    // Fallback: Check magic bytes
+    if (str_starts_with($body, "\x89PNG")) {
+        $ext = "png";
+    } elseif (str_starts_with($body, "%PDF")) {
+        $ext = "pdf";
+    } else {
+        // fallback based on content-type
+        $ext = match ($contentType) {
+            'image/png' => 'png',
+            'application/pdf' => 'pdf',
+            default => 'bin'
+        };
+    }
+
+    // Save file
+    $filename = "abha_card.$ext";
+    file_put_contents($filename, $body);
+
+    echo "✅ ABHA Card saved as $filename\n";
 }
+
 
 // === MAIN EXECUTION ===
 try {
-    $aadhaar = readline("Enter Aadhaar number: ");
+    $aadhaar = readline("📥 Enter Aadhaar number (12 digits): ");
+    if (!preg_match('/^\d{12}$/', $aadhaar)) {
+        throw new Exception("⚠️ Invalid Aadhaar number. Must be exactly 12 digits.");
+    }
+
     $encryptedAadhaar = encryptWithPublicKey($aadhaar);
 
     $session = new abdm_session_manager();
@@ -175,16 +207,28 @@ try {
 
     echo "📨 Sending OTP request...\n";
     $txnId = requestOtp($encryptedAadhaar, $accessToken);
-    echo "✅ OTP sent. txnId: $txnId\n";
+    echo "✅ OTP sent successfully. txnId: $txnId\n";
 
-    $otp = readline("Enter OTP received: ");
+    $otp = readline("📥 Enter OTP received: ");
+    if (!preg_match('/^\d{6}$/', $otp)) {
+        throw new Exception("⚠️ Invalid OTP. Must be 6 digits.");
+    }
+
     $encryptedOtp = encryptWithPublicKey($otp);
-    $mobile = "9650063029"; // ✅ Replace with correct linked mobile if needed
+
+    $mobile = readline("📱 Enter linked mobile number: ");
+    if (!preg_match('/^[6-9]\d{9}$/', $mobile)) {
+        throw new Exception("⚠️ Invalid mobile number.");
+    }
 
     echo "🔐 Verifying OTP and enrolling...\n";
     $result = verifyOtp($txnId, $encryptedOtp, $accessToken, $mobile);
 
     echo "✅ Verification Status: HTTP " . $result['httpCode'] . "\n";
+
+    if ($result['httpCode'] !== 200 || empty($result['body']['tokens']['token'])) {
+        throw new Exception("❌ Enrollment failed or token not received.\nResponse:\n" . $result['raw']);
+    }
 
     $enrollmentToken = $result['body']['tokens']['token'];
     $authorizationToken = $session->getAccessToken();
@@ -195,5 +239,5 @@ try {
     downloadAbhaCard($authorizationToken, $enrollmentToken, $requestId, $timestamp);
 
 } catch (Exception $e) {
-    echo "❌ Error: " . $e->getMessage() . "\n";
+    echo "\n🚨 Error: " . $e->getMessage() . "\n";
 }
